@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP=nadar
+# Konfiguraatio on dataa, ei suoritettavaa shell-koodia.
+CONFIG_FILE=${NADAR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/nadar/nadar.conf}
+LISTENPROTO='TCP,UDP'
+EXCLUDEPORTS=''
+EXCLUDE_PROCESSES=''
+EXCLUDE_PIDS=''
+declare -a FILTER_PROCESSES=() FILTER_PIDS=()
+INTERVAL=10
+
+trim() {
+  local v=$1
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  REPLY=$v
+}
+
+load_config() {
+  local line key value item proto port range_start range_end
+  if [[ -f $CONFIG_FILE ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      trim "$line"; line=$REPLY
+      [[ -z $line || ${line:0:1} == '#' ]] && continue
+      if [[ ! $line =~ ^([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+        printf 'NADAR: virheellinen asetusrivi: %s\n' "$line" >&2; return 2
+      fi
+      key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+      trim "$value"; value=$REPLY
+      if [[ $value == \"*\" || $value == \'*\' ]]; then
+        value=${value:1:${#value}-2}
+      fi
+      case $key in
+        LISTENPROTO) LISTENPROTO=$value ;;
+        EXCLUDEPORTS) EXCLUDEPORTS=$value ;;
+        EXCLUDE_PROCESSES) EXCLUDE_PROCESSES=$value ;;
+        EXCLUDE_PIDS) EXCLUDE_PIDS=$value ;;
+        NADAR_INTERVAL) INTERVAL=$value ;;
+        *) printf 'NADAR: tuntematon asetus %s\n' "$key" >&2; return 2 ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+  # Ympäristömuuttuja ohittaa asetustiedoston aikavälin.
+  INTERVAL=${NADAR_INTERVAL:-$INTERVAL}
+  LISTENPROTO=${LISTENPROTO^^}
+  LISTENPROTO=${LISTENPROTO//[[:space:]]/}
+  case $LISTENPROTO in
+    TCP|UDP|TCP,UDP|UDP,TCP) ;;
+    *) printf 'NADAR: LISTENPROTO on oltava TCP, UDP tai TCP,UDP\n' >&2; return 2 ;;
+  esac
+  [[ $INTERVAL =~ ^[0-9]+$ ]] && (( 10#$INTERVAL >= 1 )) || {
+    echo 'NADAR: NADAR_INTERVAL on oltava positiivinen kokonaisluku' >&2; return 2;
+  }
+  EXCLUDEPORTS=${EXCLUDEPORTS^^}
+  EXCLUDEPORTS=${EXCLUDEPORTS//[[:space:]]/}
+  local -a excludes=()
+  IFS=',' read -r -a excludes <<< "$EXCLUDEPORTS"
+  for item in "${excludes[@]}"; do
+    [[ -z $item ]] && continue
+    if [[ $item =~ ^((TCP|UDP):)?([0-9]+)(-([0-9]+))?$ ]]; then
+      range_start=${BASH_REMATCH[3]}
+      range_end=${BASH_REMATCH[5]:-${BASH_REMATCH[3]}}
+      (( 10#$range_start <= 65535 && 10#$range_end <= 65535 && 10#$range_start <= 10#$range_end )) || {
+        echo "NADAR: virheellinen porttialue: $item" >&2; return 2;
+      }
+    else
+      echo "NADAR: virheellinen EXCLUDEPORTS-arvo: $item" >&2; return 2
+    fi
+  done
+  # Tee nimen ja PID:n poissulkulistat valmiiksi. Tyhjä arvo sallitaan.
+  local -a names=() numbers=()
+  IFS=',' read -r -a names <<< "$EXCLUDE_PROCESSES"
+  for item in "${names[@]}"; do
+    trim "$item"; item=$REPLY
+    [[ -n $item ]] || { echo 'NADAR: tyhjä nimi EXCLUDE_PROCESSES-arvossa' >&2; return 2; }
+    FILTER_PROCESSES+=("${item,,}")
+  done
+  IFS=',' read -r -a numbers <<< "$EXCLUDE_PIDS"
+  for item in "${numbers[@]}"; do
+    trim "$item"; item=$REPLY
+    [[ $item =~ ^[0-9]+$ ]] || {
+      echo "NADAR: virheellinen PID EXCLUDE_PIDS-arvossa: $item" >&2; return 2;
+    }
+    # Normalisoi etunollat ilman kokonaislukujen ylivuotovaaraa.
+    while [[ ${#item} -gt 1 && $item == 0* ]]; do item=${item#0}; done
+    [[ $item != 0 ]] || { echo 'NADAR: PID 0 ei ole kelvollinen poikkeus' >&2; return 2; }
+    FILTER_PIDS+=("$item")
+  done
+}
+
+is_excluded_owner() {
+  local name=${1,,} pid=$2 item
+  for item in "${FILTER_PROCESSES[@]}"; do
+    [[ $name == "$item" ]] && return 0
+  done
+  for item in "${FILTER_PIDS[@]}"; do
+    [[ $pid == "$item" ]] && return 0
+  done
+  return 1
+}
+
+allowed_listener() {
+  local proto=${1^^} port=$2 item itemproto first last
+  [[ ,$LISTENPROTO, == *",$proto,"* ]] || return 1
+  local -a excludes=()
+  IFS=',' read -r -a excludes <<< "$EXCLUDEPORTS"
+  for item in "${excludes[@]}"; do
+    [[ -z $item ]] && continue
+    itemproto=''
+    if [[ $item == *:* ]]; then itemproto=${item%%:*}; item=${item#*:}; fi
+    [[ -z $itemproto || $itemproto == "$proto" ]] || continue
+    first=${item%%-*}; last=$first
+    [[ $item == *-* ]] && last=${item#*-}
+    if [[ $port =~ ^[0-9]+$ ]] && (( 10#$port >= 10#$first && 10#$port <= 10#$last )); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+load_config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/nadar
+STATE_FILE=$STATE_DIR/listeners.tsv
+
+if [[ -t 1 && ${NO_COLOR:-} == '' ]]; then
+  RESET=$'\e[0m'; DIM=$'\e[2m'; VIOLET=$'\e[38;2;184;140;255m'; BLUE=$'\e[38;2;91;192;255m'
+  AMBER=$'\e[38;2;255;197;109m'; GREEN=$'\e[38;2;110;231;173m'; RED=$'\e[38;2;255;133;149m'
+else
+  RESET= DIM= VIOLET= BLUE= AMBER= GREEN= RED=
+fi
+
+usage() {
+  cat <<'HELP'
+NADAR v0.4 — paikallisten TCP/UDP-kuuntelijoiden valvonta
+  nadar / --list     värillinen porttilista
+  nadar --summary    yhdistetty porttikooste
+  nadar --summary-html  luo ./summary.html ja avaa selaimessa
+  nadar --watch      jatkuva valvonta ja KDE-ilmoitukset
+  nadar --once       yksi tarkistus, tallentaa uuden tilan
+  nadar --status     systemd-käyttäjäpalvelun tila
+  nadar --reset      poista tallennettu lähtötilanne
+  nadar --help       tämä ohje
+
+Konfiguraatio: ~/.config/nadar/nadar.conf (tai $XDG_CONFIG_HOME/nadar/nadar.conf)
+  LISTENPROTO="TCP,UDP"      oletus; myös "TCP" tai "UDP"
+  EXCLUDEPORTS="5353,1900"  ohitettavat portit (kaikki protokollat)
+  EXCLUDEPORTS="UDP:5353,TCP:445,40000-41000"  myös protokolla- ja aluekohtaiset
+  EXCLUDE_PROCESSES="spotify,firefox"  prosessinimet (ei kirjainkokoeroa)
+  EXCLUDE_PIDS="1567,1447"  yksittäiset PID:t
+  NADAR_INTERVAL=10          valvontaväli sekunteina (ympäristömuuttuja ohittaa)
+HELP
+}
+
+# Tulostaa TSV-rivit: protocol, state, local_address, port, process, pid.
+# ss:n paikallisosoite on viimeistä kaksoispistettä myöten IP/host,
+# mikä toimii myös IPv6:n [::]:port-esitysmuodolle.
+collect() {
+  local line proto state recvq sendq local_addr peer rest address port proc pid output
+  local tail owner_name owner_pid match owners_found pair
+  local -a names=() pids=()
+  local -A seen_owners=()
+  output=$(LC_ALL=C ss -H -tulnp) || return 1
+  while IFS= read -r line; do
+    read -r proto state recvq sendq local_addr peer rest <<< "$line"
+    [[ -n ${local_addr:-} ]] || continue
+    address=${local_addr%:*}
+    port=${local_addr##*:}
+    allowed_listener "$proto" "$port" || continue
+
+    # ss:n users-kentässä voi olla monta eri prosessia/PID:tä.
+    # Suodata omistajat erikseen: poistettava PID ei piilota toista,
+    # sallittua prosessia, joka jakaa saman socketin.
+    tail=${rest:-}
+    owners_found=0
+    names=(); pids=(); seen_owners=()
+    while [[ $tail =~ \(\"([^\"]+)\",pid=([0-9]+) ]]; do
+      match=${BASH_REMATCH[0]}
+      owner_name=${BASH_REMATCH[1]}
+      owner_pid=${BASH_REMATCH[2]}
+      tail=${tail#*"$match"}
+      ((owners_found+=1))
+      is_excluded_owner "$owner_name" "$owner_pid" && continue
+      pair="$owner_name"$'\034'"$owner_pid"
+      if [[ ! -v seen_owners["$pair"] ]]; then
+        seen_owners["$pair"]=1
+        names+=("$owner_name")
+        pids+=("$owner_pid")
+      fi
+    done
+
+    if (( owners_found > 0 )); then
+      # Socketilta poistettiin kaikki tunnetut omistajat.
+      ((${#names[@]} > 0)) || continue
+      proc=$(printf '%s, ' "${names[@]}"); proc=${proc%, }
+      pid=$(printf '%s, ' "${pids[@]}"); pid=${pid%, }
+    else
+      # Tietoja ei näy ilman pääkäyttäjän oikeuksia: ei voida
+      # päätellä, että socket kuuluu suodatettuun sovellukseen.
+      proc='—'; pid='—'
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$proto" "$state" "$address" "$port" "$proc" "$pid"
+  done <<< "$output"
+}
+
+show_list() {
+  local proto state address port proc pid
+  printf '%-5s %-8s %-36s %-8s %-24s %s\n' PROTO STATE ADDRESS PORT PROCESS PID
+  printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────────────────'
+  while IFS=$'\t' read -r proto state address port proc pid; do
+    printf '%b%-5s%b %-8s %b%-36s%b %b%-8s%b %b%-24s%b %b%s%b\n' \
+      "$VIOLET" "$proto" "$RESET" "$state" "$BLUE" "$address" "$RESET" \
+      "$AMBER" "$port" "$RESET" "$GREEN" "$proc" "$RESET" "$RED" "$pid" "$RESET"
+  done < <(collect)
+}
+
+# Yhdistelee saman protocol/address/port-yhdistelmän soketit.
+# Tulos: protocol, state, address, port, processes, pids, sockets
+summary_rows() {
+  local proto state address port proc pid key item
+  local -a names=() numbers=()
+  local -A counts=() states=() processes=() pids=() seenproc=() seenpid=()
+  local -a order=()
+  while IFS=$'\t' read -r proto state address port proc pid; do
+    [[ -n $proto && -n $port ]] || continue
+    key="${proto}"$'\034'"${address}"$'\034'"${port}"
+    if [[ ! -v counts[$key] ]]; then
+      counts[$key]=0
+      states[$key]=$state
+      processes[$key]=''
+      pids[$key]=''
+      order+=("$key")
+    fi
+    (( counts[$key]+=1 ))
+    if [[ $proc != '—' ]]; then
+      IFS=',' read -r -a names <<< "$proc"
+      for item in "${names[@]}"; do
+        trim "$item"; item=$REPLY
+        if [[ -n $item && ! -v seenproc["$key|$item"] ]]; then
+          seenproc["$key|$item"]=1
+          processes[$key]+="${processes[$key]:+, }$item"
+        fi
+      done
+    fi
+    if [[ $pid != '—' ]]; then
+      IFS=',' read -r -a numbers <<< "$pid"
+      for item in "${numbers[@]}"; do
+        trim "$item"; item=$REPLY
+        if [[ -n $item && ! -v seenpid["$key|$item"] ]]; then
+          seenpid["$key|$item"]=1
+          pids[$key]+="${pids[$key]:+, }$item"
+        fi
+      done
+    fi
+  done < <(collect)
+  for key in "${order[@]}"; do
+    IFS=$'\034' read -r proto address port <<< "$key"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$proto" "${states[$key]}" "$address" "$port" \
+      "${processes[$key]:-—}" "${pids[$key]:-—}" "${counts[$key]}"
+  done
+}
+
+show_summary() {
+  local proto state address port proc pid sockets
+  printf '%b◈ NADAR — PORT SUMMARY%b\n' "$VIOLET" "$RESET"
+  printf '%-5s %-8s %-36s %-8s %-22s %-12s %s\n' PROTO STATE ADDRESS PORT PROCESS PID SOCKETS
+  printf '%s\n' '──────────────────────────────────────────────────────────────────────────────────────────────────────────────────'
+  while IFS=$'\t' read -r proto state address port proc pid sockets; do
+    printf '%b%-5s%b %-8s %b%-36s%b %b%-8s%b %b%-22s%b %b%-12s%b %s\n' \
+      "$VIOLET" "$proto" "$RESET" "$state" "$BLUE" "$address" "$RESET" \
+      "$AMBER" "$port" "$RESET" "$GREEN" "$proc" "$RESET" "$RED" "$pid" "$RESET" "$sockets"
+  done < <(summary_rows)
+}
+
+html_escape() {
+  local s=$1
+  s=${s//&/\&amp;}
+  s=${s//</\&lt;}
+  s=${s//>/\&gt;}
+  s=${s//\"/\&quot;}
+  s=${s//\'/\&#39;}
+  printf '%s' "$s"
+}
+
+summary_html() {
+  local report=${NADAR_HTML_PATH:-$PWD/summary.html}
+  local temp proto state address port proc pid sockets rows=0 tcp=0 udp=0
+  mkdir -p -- "$(dirname -- "$report")"
+  temp=$(mktemp "$(dirname -- "$report")/.nadar-summary.XXXXXXXX")
+  {
+    cat <<'HTML'
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NADAR — Port Summary</title>
+<style>
+:root{color-scheme:dark;font-family:ui-monospace,Consolas,"DejaVu Sans Mono",monospace}
+*{box-sizing:border-box}body{background:#0a1020;color:#dce5fa;margin:0;padding:3rem 2rem}
+main{max-width:1420px;margin:auto}h1{color:#c9a7ff;font-size:2rem;letter-spacing:.09em;margin:0}
+.subtitle{color:#8090ad;margin:.6rem 0 2rem}.panel{border:1px solid #344062;border-radius:12px;overflow:auto;background:#11192d}
+table{border-collapse:collapse;width:100%;font-size:.87rem;white-space:nowrap}
+th{text-align:left;background:#1a2440;color:#9eaccb;position:sticky;top:0}
+th,td{padding:.85rem 1.1rem;border-bottom:1px solid #293451}tbody tr:hover{background:#1b2743}
+.proto{color:#b88cff}.addr{color:#5bc0ff}.port{color:#ffc56d}.proc{color:#6ee7ad}.pid{color:#ff8595}
+footer{color:#8090ad;margin-top:1.4rem;font-size:.8rem}
+@media(max-width:680px){body{padding:1.2rem}h1{font-size:1.5rem}}
+</style>
+</head>
+<body><main>
+<h1>◈ NADAR</h1><p class="subtitle">NETWORK ANOMALY DETECTION AND REPORTING · LOCAL PORT SUMMARY</p>
+<div class="panel"><table><thead><tr><th>PROTO</th><th>STATE</th><th>ADDRESS</th><th>PORT</th><th>PROCESS</th><th>PID</th><th>SOCKETS</th></tr></thead><tbody>
+HTML
+    while IFS=$'\t' read -r proto state address port proc pid sockets; do
+      ((rows+=1))
+      if [[ $proto == tcp ]]; then ((tcp+=1)); else ((udp+=1)); fi
+      printf '<tr><td class="proto">%s</td><td>%s</td><td class="addr">%s</td><td class="port">%s</td><td class="proc">%s</td><td class="pid">%s</td><td>%s</td></tr>\n' \
+        "$(html_escape "$proto")" "$(html_escape "$state")" "$(html_escape "$address")" \
+        "$(html_escape "$port")" "$(html_escape "$proc")" "$(html_escape "$pid")" "$sockets"
+    done < <(summary_rows)
+    printf '</tbody></table></div><footer>%s endpoints (TCP %s / UDP %s) · %s · Local listeners only; no external port scan.</footer></main></body></html>\n' \
+      "$rows" "$tcp" "$udp" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  } > "$temp"
+  mv -- "$temp" "$report"
+  printf 'HTML-raportti: %s\n' "$report"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$report" >/dev/null 2>&1 &
+  else
+    printf 'xdg-open ei ole asennettu; avaa tiedosto selaimessa.\n' >&2
+  fi
+}
+
+# Porttihavaintojen avain on protokolla + kuunteluosoite + portti.
+# Prosessin PID-muutos yksinään ei aiheuta uutta porttihälytystä.
+keys_of() {
+  awk -F '\t' 'NF >= 4 {print $1 "\t" $3 "\t" $4}' "$1" | LC_ALL=C sort -u
+}
+
+notify_new() {
+  local proto=$1 address=$2 port=$3
+  logger -t nadar -- "NEW LISTENER $proto $address:$port"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a 'NADAR' -u normal -i network-wired \
+      'NADAR: uusi kuunteluportti' "${proto^^} ${address}:${port} — ulkoista saavutettavuutta ei ole tarkistettu" \
+      || true
+  fi
+}
+
+check_once() {
+  local newfile oldkeys newkeys additions proto address port
+  mkdir -p -- "$STATE_DIR"
+  newfile=$(mktemp "$STATE_DIR/.listeners.XXXXXX")
+  oldkeys=$(mktemp "$STATE_DIR/.oldkeys.XXXXXX")
+  newkeys=$(mktemp "$STATE_DIR/.newkeys.XXXXXX")
+  # Poista väliaikaiset myös keskeytyksessä.
+  trap 'rm -f -- "$newfile" "$oldkeys" "$newkeys"' RETURN
+  collect > "$newfile"
+  if [[ -f $STATE_FILE ]]; then
+    keys_of "$STATE_FILE" > "$oldkeys"
+    keys_of "$newfile" > "$newkeys"
+    while IFS=$'\t' read -r proto address port; do
+      [[ -n $proto ]] && notify_new "$proto" "$address" "$port"
+    done < <(comm -13 "$oldkeys" "$newkeys")
+  else
+    logger -t nadar -- 'Baseline initialized; existing listeners are not alerted'
+  fi
+  mv -f -- "$newfile" "$STATE_FILE"
+  rm -f -- "$oldkeys" "$newkeys"
+  trap - RETURN
+}
+
+case ${1:-} in
+  ''|--list) show_list ;;
+  --summary) show_summary ;;
+  --summary-html) summary_html ;;
+  --watch)
+    echo "NADAR watching local listeners every ${INTERVAL}s" >&2
+    while :; do check_once; sleep "$INTERVAL"; done
+    ;;
+  --once) check_once ;;
+  --status) systemctl --user status nadar.service --no-pager ;;
+  --reset) rm -f -- "$STATE_FILE"; echo 'Lähtötilanne nollattu.' ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

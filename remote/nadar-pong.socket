@@ -1,0 +1,10 @@
+[Unit]
+Description=NADAR remote health check TCP socket
+
+[Socket]
+ListenStream=42000
+Accept=yes
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

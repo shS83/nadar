@@ -2,20 +2,36 @@
 set -Eeuo pipefail
 
 APP=nadar
-# Konfiguraatio on dataa, ei suoritettavaa shell-koodia.
+# Configuration is parsed as data, not sourced as shell code.
 CONFIG_FILE=${NADAR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/nadar/nadar.conf}
 LISTENPROTO='TCP,UDP'
 EXCLUDEPORTS=''
 EXCLUDE_PROCESSES=''
 EXCLUDE_PIDS=''
-declare -a FILTER_PROCESSES=() FILTER_PIDS=()
+EXCLUDE_PROCESS_NOTIFY=''
+declare -a FILTER_PROCESSES=() FILTER_PIDS=() FILTER_NOTIFY_PROCESSES=()
 INTERVAL=10
+REMOTE_POKE_HOST='prometheus-alexander.fi'
+REMOTE_POKE_PORT=42000
+REMOTE_SSH_HOST='ouroboros'
+REMOTE_SCAN_TARGET=''
 
 trim() {
   local v=$1
   v="${v#"${v%%[![:space:]]*}"}"
   v="${v%"${v##*[![:space:]]}"}"
   REPLY=$v
+}
+
+valid_ipv4() {
+  local ip=$1 part
+  local -a octets=()
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS='.' read -r -a octets <<< "$ip"
+  ((${#octets[@]} == 4)) || return 1
+  for part in "${octets[@]}"; do
+    ((${#part} <= 3)) && (( 10#$part <= 255 )) || return 1
+  done
 }
 
 load_config() {
@@ -25,7 +41,7 @@ load_config() {
       trim "$line"; line=$REPLY
       [[ -z $line || ${line:0:1} == '#' ]] && continue
       if [[ ! $line =~ ^([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-        printf 'NADAR: virheellinen asetusrivi: %s\n' "$line" >&2; return 2
+        printf 'NADAR: invalid config line: %s\n' "$line" >&2; return 2
       fi
       key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
       trim "$value"; value=$REPLY
@@ -37,21 +53,26 @@ load_config() {
         EXCLUDEPORTS) EXCLUDEPORTS=$value ;;
         EXCLUDE_PROCESSES) EXCLUDE_PROCESSES=$value ;;
         EXCLUDE_PIDS) EXCLUDE_PIDS=$value ;;
+        EXCLUDE_PROCESS_NOTIFY) EXCLUDE_PROCESS_NOTIFY=$value ;;
         NADAR_INTERVAL) INTERVAL=$value ;;
-        *) printf 'NADAR: tuntematon asetus %s\n' "$key" >&2; return 2 ;;
+        REMOTE_POKE_HOST) REMOTE_POKE_HOST=$value ;;
+        REMOTE_POKE_PORT) REMOTE_POKE_PORT=$value ;;
+        REMOTE_SSH_HOST) REMOTE_SSH_HOST=$value ;;
+        REMOTE_SCAN_TARGET) REMOTE_SCAN_TARGET=$value ;;
+        *) printf 'NADAR: unknown setting %s\n' "$key" >&2; return 2 ;;
       esac
     done < "$CONFIG_FILE"
   fi
-  # Ympäristömuuttuja ohittaa asetustiedoston aikavälin.
+  # Environment variable overrides the config-file polling interval.
   INTERVAL=${NADAR_INTERVAL:-$INTERVAL}
   LISTENPROTO=${LISTENPROTO^^}
   LISTENPROTO=${LISTENPROTO//[[:space:]]/}
   case $LISTENPROTO in
     TCP|UDP|TCP,UDP|UDP,TCP) ;;
-    *) printf 'NADAR: LISTENPROTO on oltava TCP, UDP tai TCP,UDP\n' >&2; return 2 ;;
+    *) printf 'NADAR: LISTENPROTO must be TCP, UDP, or TCP,UDP\n' >&2; return 2 ;;
   esac
   [[ $INTERVAL =~ ^[0-9]+$ ]] && (( 10#$INTERVAL >= 1 )) || {
-    echo 'NADAR: NADAR_INTERVAL on oltava positiivinen kokonaisluku' >&2; return 2;
+    echo 'NADAR: NADAR_INTERVAL must be a positive integer' >&2; return 2;
   }
   EXCLUDEPORTS=${EXCLUDEPORTS^^}
   EXCLUDEPORTS=${EXCLUDEPORTS//[[:space:]]/}
@@ -63,31 +84,52 @@ load_config() {
       range_start=${BASH_REMATCH[3]}
       range_end=${BASH_REMATCH[5]:-${BASH_REMATCH[3]}}
       (( 10#$range_start <= 65535 && 10#$range_end <= 65535 && 10#$range_start <= 10#$range_end )) || {
-        echo "NADAR: virheellinen porttialue: $item" >&2; return 2;
+        echo "NADAR: invalid port range: $item" >&2; return 2;
       }
     else
-      echo "NADAR: virheellinen EXCLUDEPORTS-arvo: $item" >&2; return 2
+      echo "NADAR: invalid EXCLUDEPORTS value: $item" >&2; return 2
     fi
   done
-  # Tee nimen ja PID:n poissulkulistat valmiiksi. Tyhjä arvo sallitaan.
+  # Prepare process-name and PID filters. Empty lists are allowed.
   local -a names=() numbers=()
   IFS=',' read -r -a names <<< "$EXCLUDE_PROCESSES"
   for item in "${names[@]}"; do
     trim "$item"; item=$REPLY
-    [[ -n $item ]] || { echo 'NADAR: tyhjä nimi EXCLUDE_PROCESSES-arvossa' >&2; return 2; }
+    [[ -n $item ]] || { echo 'NADAR: empty entry in EXCLUDE_PROCESSES' >&2; return 2; }
     FILTER_PROCESSES+=("${item,,}")
+  done
+  # Notification-only exclusions do not remove owners from reports.
+  IFS=',' read -r -a names <<< "$EXCLUDE_PROCESS_NOTIFY"
+  for item in "${names[@]}"; do
+    trim "$item"; item=$REPLY
+    [[ -n $item ]] || { echo 'NADAR: empty entry in EXCLUDE_PROCESS_NOTIFY' >&2; return 2; }
+    FILTER_NOTIFY_PROCESSES+=("${item,,}")
   done
   IFS=',' read -r -a numbers <<< "$EXCLUDE_PIDS"
   for item in "${numbers[@]}"; do
     trim "$item"; item=$REPLY
     [[ $item =~ ^[0-9]+$ ]] || {
-      echo "NADAR: virheellinen PID EXCLUDE_PIDS-arvossa: $item" >&2; return 2;
+      echo "NADAR: invalid PID in EXCLUDE_PIDS: $item" >&2; return 2;
     }
-    # Normalisoi etunollat ilman kokonaislukujen ylivuotovaaraa.
+    # Normalize leading zeroes without integer overflow.
     while [[ ${#item} -gt 1 && $item == 0* ]]; do item=${item#0}; done
-    [[ $item != 0 ]] || { echo 'NADAR: PID 0 ei ole kelvollinen poikkeus' >&2; return 2; }
+    [[ $item != 0 ]] || { echo 'NADAR: PID 0 is not a valid exclusion' >&2; return 2; }
     FILTER_PIDS+=("$item")
   done
+  [[ $REMOTE_POKE_HOST =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || {
+    echo 'NADAR: REMOTE_POKE_HOST must be a hostname or IPv4 address' >&2; return 2;
+  }
+  [[ $REMOTE_SSH_HOST =~ ^([a-zA-Z0-9_.-]+@)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || {
+    echo 'NADAR: invalid REMOTE_SSH_HOST (use a hostname or SSH alias)' >&2; return 2;
+  }
+  if [[ ! $REMOTE_POKE_PORT =~ ^[0-9]+$ ]] || (( 10#$REMOTE_POKE_PORT < 1 || 10#$REMOTE_POKE_PORT > 65535 )); then
+    echo 'NADAR: REMOTE_POKE_PORT must be in the range 1-65535' >&2; return 2
+  fi
+  if [[ -n $REMOTE_SCAN_TARGET ]]; then
+    valid_ipv4 "$REMOTE_SCAN_TARGET" || {
+      echo 'NADAR: REMOTE_SCAN_TARGET must be a valid IPv4 address' >&2; return 2;
+    }
+  fi
 }
 
 is_excluded_owner() {
@@ -97,6 +139,14 @@ is_excluded_owner() {
   done
   for item in "${FILTER_PIDS[@]}"; do
     [[ $pid == "$item" ]] && return 0
+  done
+  return 1
+}
+
+is_notify_excluded_process() {
+  local name=${1,,} item
+  for item in "${FILTER_NOTIFY_PROCESSES[@]}"; do
+    [[ $name == "$item" ]] && return 0
   done
   return 1
 }
@@ -133,29 +183,58 @@ fi
 
 usage() {
   cat <<'HELP'
-NADAR v0.4 — paikallisten TCP/UDP-kuuntelijoiden valvonta
-  nadar / --list     värillinen porttilista
-  nadar --summary    yhdistetty porttikooste
-  nadar --summary-html  luo ./summary.html ja avaa selaimessa
-  nadar --watch      jatkuva valvonta ja KDE-ilmoitukset
-  nadar --once       yksi tarkistus, tallentaa uuden tilan
-  nadar --status     systemd-käyttäjäpalvelun tila
-  nadar --reset      poista tallennettu lähtötilanne
-  nadar --help       tämä ohje
+NADAR - Network Anomaly Detection and Reporting v0.6.0
 
-Konfiguraatio: ~/.config/nadar/nadar.conf (tai $XDG_CONFIG_HOME/nadar/nadar.conf)
-  LISTENPROTO="TCP,UDP"      oletus; myös "TCP" tai "UDP"
-  EXCLUDEPORTS="5353,1900"  ohitettavat portit (kaikki protokollat)
-  EXCLUDEPORTS="UDP:5353,TCP:445,40000-41000"  myös protokolla- ja aluekohtaiset
-  EXCLUDE_PROCESSES="spotify,firefox"  prosessinimet (ei kirjainkokoeroa)
-  EXCLUDE_PIDS="1567,1447"  yksittäiset PID:t
-  NADAR_INTERVAL=10          valvontaväli sekunteina (ympäristömuuttuja ohittaa)
+Usage:
+  nadar [--list]                    Show colorized local TCP/UDP sockets
+  nadar --summary                   Show aggregated listening endpoints
+  nadar --summary-html              Generate summary.html and open the browser
+  nadar --watch                     Monitor new listeners; send desktop alerts
+  nadar --once                      Run a single detection pass
+  nadar --test-notify               Send a test desktop notification
+  nadar --poke-remote               Request PING/OK on remote TCP port 42000
+  nadar --scan [PORTS]              Remote TCP/UDP Nmap scan via restricted sudo helper
+  nadar --remote-verify [PORTS]     Alias of --scan (backward compatible)
+  nadar --status                    Show the systemd user service status
+  nadar --reset                     Reset the local listener baseline
+  nadar --help                      Show this help
+
+Remote scan examples:
+  nadar --scan
+  nadar --scan TCP:420,UDP:11000
+  nadar --scan TCP:80,TCP:443,TCP:2222
+
+  Without PORTS, scans all currently monitored non-loopback TCP/UDP
+  listener ports. By default, the target is your public IPv4 address
+  as reported by ifconfig.co. Nmap runs on the configured SSH host.
+  Ouroboros runs /usr/local/libexec/nadar-scan through limited sudo.
+  Install remote/nadar-scan and remote/nadar-scan.sudoers first.
+  The helper accepts only validated TCP/UDP ports and IPv4 targets.
+  TCP "open" confirms reachability from the SSH host, not worldwide.
+  UDP "open|filtered" is inconclusive.
+
+Configuration: ~/.config/nadar/nadar.conf (or XDG_CONFIG_HOME equivalent)
+  LISTENPROTO="TCP,UDP"         TCP, UDP, or both
+  EXCLUDEPORTS="UDP:5353"      Ports and optional protocol-specific ranges
+  EXCLUDE_PROCESSES="spotify"   Exclude named processes from all output
+  EXCLUDE_PIDS=""              Exclude process IDs from all output
+  EXCLUDE_PROCESS_NOTIFY=""    Suppress notifications only
+  NADAR_INTERVAL=10             Polling interval in seconds
+  REMOTE_POKE_HOST="prometheus-alexander.fi"
+  REMOTE_POKE_PORT=42000
+  REMOTE_SSH_HOST="ouroboros"   SSH alias or remote hostname
+  REMOTE_SCAN_TARGET=""        Optional public IPv4 override
+
+Security:
+  Only scan systems you own or are authorized to test. The port 42000
+  responder accepts PING only; Nmap scan commands travel over SSH,
+  never through the public TCP responder.
 HELP
 }
 
-# Tulostaa TSV-rivit: protocol, state, local_address, port, process, pid.
-# ss:n paikallisosoite on viimeistä kaksoispistettä myöten IP/host,
-# mikä toimii myös IPv6:n [::]:port-esitysmuodolle.
+# Output TSV: protocol, state, local_address, port, process, pid.
+# Split the local ss endpoint at the last colon into host and port.
+# This also supports bracketed IPv6 endpoints such as [::]:port.
 collect() {
   local line proto state recvq sendq local_addr peer rest address port proc pid output
   local tail owner_name owner_pid match owners_found pair
@@ -169,9 +248,9 @@ collect() {
     port=${local_addr##*:}
     allowed_listener "$proto" "$port" || continue
 
-    # ss:n users-kentässä voi olla monta eri prosessia/PID:tä.
-    # Suodata omistajat erikseen: poistettava PID ei piilota toista,
-    # sallittua prosessia, joka jakaa saman socketin.
+    # The ss users field can contain multiple processes/PIDs.
+    # Filter owners independently: excluding one PID must not hide
+    # another allowed process that shares the same socket.
     tail=${rest:-}
     owners_found=0
     names=(); pids=(); seen_owners=()
@@ -191,17 +270,28 @@ collect() {
     done
 
     if (( owners_found > 0 )); then
-      # Socketilta poistettiin kaikki tunnetut omistajat.
+      # Every known socket owner was excluded.
       ((${#names[@]} > 0)) || continue
       proc=$(printf '%s, ' "${names[@]}"); proc=${proc%, }
       pid=$(printf '%s, ' "${pids[@]}"); pid=${pid%, }
     else
-      # Tietoja ei näy ilman pääkäyttäjän oikeuksia: ei voida
-      # päätellä, että socket kuuluu suodatettuun sovellukseen.
+      # Owner details may be hidden without elevated permissions:
+      # we cannot assume the unknown owner matches an exclusion.
       proc='—'; pid='—'
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$proto" "$state" "$address" "$port" "$proc" "$pid"
   done <<< "$output"
+}
+
+# Bash printf uses byte-oriented string widths for UTF-8 in this context,
+# so a three-byte '—' would shift the following column.
+# Add padding based on visible character width; substitute
+# '—' -> '-' only while measuring, preserving the displayed dash.
+print_padded() {
+  local value=$1 width=$2 visible=${1//—/-} pad
+  pad=$((width - ${#visible}))
+  printf '%s' "$value"
+  if ((pad > 0)); then printf '%*s' "$pad" ''; fi
 }
 
 show_list() {
@@ -209,14 +299,18 @@ show_list() {
   printf '%-5s %-8s %-36s %-8s %-24s %s\n' PROTO STATE ADDRESS PORT PROCESS PID
   printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────────────────'
   while IFS=$'\t' read -r proto state address port proc pid; do
-    printf '%b%-5s%b %-8s %b%-36s%b %b%-8s%b %b%-24s%b %b%s%b\n' \
-      "$VIOLET" "$proto" "$RESET" "$state" "$BLUE" "$address" "$RESET" \
-      "$AMBER" "$port" "$RESET" "$GREEN" "$proc" "$RESET" "$RED" "$pid" "$RESET"
+    printf '%b%-5s%b %-8s %b' "$VIOLET" "$proto" "$RESET" "$state" "$BLUE"
+    print_padded "$address" 36
+    printf '%b %b' "$RESET" "$AMBER"
+    print_padded "$port" 8
+    printf '%b %b' "$RESET" "$GREEN"
+    print_padded "$proc" 24
+    printf '%b %b%s%b\n' "$RESET" "$RED" "$pid" "$RESET"
   done < <(collect)
 }
 
-# Yhdistelee saman protocol/address/port-yhdistelmän soketit.
-# Tulos: protocol, state, address, port, processes, pids, sockets
+# Group sockets with identical protocol/address/port.
+# Output: protocol, state, address, port, processes, pids, sockets.
 summary_rows() {
   local proto state address port proc pid key item
   local -a names=() numbers=()
@@ -268,9 +362,15 @@ show_summary() {
   printf '%-5s %-8s %-36s %-8s %-22s %-12s %s\n' PROTO STATE ADDRESS PORT PROCESS PID SOCKETS
   printf '%s\n' '──────────────────────────────────────────────────────────────────────────────────────────────────────────────────'
   while IFS=$'\t' read -r proto state address port proc pid sockets; do
-    printf '%b%-5s%b %-8s %b%-36s%b %b%-8s%b %b%-22s%b %b%-12s%b %s\n' \
-      "$VIOLET" "$proto" "$RESET" "$state" "$BLUE" "$address" "$RESET" \
-      "$AMBER" "$port" "$RESET" "$GREEN" "$proc" "$RESET" "$RED" "$pid" "$RESET" "$sockets"
+    printf '%b%-5s%b %-8s %b' "$VIOLET" "$proto" "$RESET" "$state" "$BLUE"
+    print_padded "$address" 36
+    printf '%b %b' "$RESET" "$AMBER"
+    print_padded "$port" 8
+    printf '%b %b' "$RESET" "$GREEN"
+    print_padded "$proc" 22
+    printf '%b %b' "$RESET" "$RED"
+    print_padded "$pid" 12
+    printf '%b %s\n' "$RESET" "$sockets"
   done < <(summary_rows)
 }
 
@@ -292,7 +392,7 @@ summary_html() {
   {
     cat <<'HTML'
 <!doctype html>
-<html lang="fi">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -325,44 +425,91 @@ HTML
       "$rows" "$tcp" "$udp" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
   } > "$temp"
   mv -- "$temp" "$report"
-  printf 'HTML-raportti: %s\n' "$report"
+  printf 'HTML report: %s\n' "$report"
   if command -v xdg-open >/dev/null 2>&1; then
     xdg-open "$report" >/dev/null 2>&1 &
   else
-    printf 'xdg-open ei ole asennettu; avaa tiedosto selaimessa.\n' >&2
+    printf 'xdg-open is unavailable; open the report in a browser.\n' >&2
   fi
 }
 
-# Porttihavaintojen avain on protokolla + kuunteluosoite + portti.
-# Prosessin PID-muutos yksinään ei aiheuta uutta porttihälytystä.
+# Listener key = protocol + bind address + port.
+# PID changes alone do not trigger new-port alerts.
 keys_of() {
   awk -F '\t' 'NF >= 4 {print $1 "\t" $3 "\t" $4}' "$1" | LC_ALL=C sort -u
 }
 
+# Find process names for a new listener in the collected snapshot.
+# EXCLUDE_PROCESS_NOTIFY suppresses alerts for the matching owners only;
+# list/summary/HTML still receive their rows from collect().
+# Status 1 means every known owner is notification-excluded.
+# If an owner is allowed or unknown, an alert is still sent.
+# Suppressed owner names are not shown even when the shared port
+# causes an alert; allowed names appear only once.
+listener_notify_processes() {
+  local snapshot=$1 wanted_proto=$2 wanted_address=$3 wanted_port=$4
+  local proto state address port process pid name result=''
+  local known_allowed=0 unknown_owner=0 matching=0
+  local -a names=()
+  local -A seen=()
+  while IFS=$'\t' read -r proto state address port process pid; do
+    [[ $proto == "$wanted_proto" && $address == "$wanted_address" && $port == "$wanted_port" ]] || continue
+    matching=1
+    if [[ -z $process || $process == '—' ]]; then
+      unknown_owner=1
+      continue
+    fi
+    IFS=',' read -r -a names <<< "$process"
+    for name in "${names[@]}"; do
+      trim "$name"; name=$REPLY
+      [[ -n $name ]] || continue
+      is_notify_excluded_process "$name" && continue
+      known_allowed=1
+      if [[ ! -v seen["$name"] ]]; then
+        seen["$name"]=1
+        result+="${result:+, }$name"
+      fi
+    done
+  done < "$snapshot"
+  if (( matching && !known_allowed && !unknown_owner )); then
+    return 1
+  fi
+  printf '%s' "$result"
+}
+
 notify_new() {
-  local proto=$1 address=$2 port=$3
-  logger -t nadar -- "NEW LISTENER $proto $address:$port"
+  local proto=$1 address=$2 port=$3 process=${4:-}
+  local message="${proto^^} ${address}:${port} — external reachability not checked"
+  if [[ -n $process ]]; then
+    logger -t nadar -- "NEW LISTENER $proto $address:$port process=$process"
+    message="${proto^^} ${address}:${port}"$'\n'"Process: ${process}"$'\n'"External reachability not checked"
+  else
+    logger -t nadar -- "NEW LISTENER $proto $address:$port"
+  fi
   if command -v notify-send >/dev/null 2>&1; then
     notify-send -a 'NADAR' -u normal -i network-wired \
-      'NADAR: uusi kuunteluportti' "${proto^^} ${address}:${port} — ulkoista saavutettavuutta ei ole tarkistettu" \
-      || true
+      'NADAR: new listening port' "$message" || true
   fi
 }
 
 check_once() {
-  local newfile oldkeys newkeys additions proto address port
+  local newfile oldkeys newkeys proto address port process
   mkdir -p -- "$STATE_DIR"
   newfile=$(mktemp "$STATE_DIR/.listeners.XXXXXX")
   oldkeys=$(mktemp "$STATE_DIR/.oldkeys.XXXXXX")
   newkeys=$(mktemp "$STATE_DIR/.newkeys.XXXXXX")
-  # Poista väliaikaiset myös keskeytyksessä.
+  # Remove temporary files on normal return or interruption.
   trap 'rm -f -- "$newfile" "$oldkeys" "$newkeys"' RETURN
   collect > "$newfile"
   if [[ -f $STATE_FILE ]]; then
     keys_of "$STATE_FILE" > "$oldkeys"
     keys_of "$newfile" > "$newkeys"
     while IFS=$'\t' read -r proto address port; do
-      [[ -n $proto ]] && notify_new "$proto" "$address" "$port"
+      if [[ -n $proto ]]; then
+        if process=$(listener_notify_processes "$newfile" "$proto" "$address" "$port"); then
+          notify_new "$proto" "$address" "$port" "$process"
+        fi
+      fi
     done < <(comm -13 "$oldkeys" "$newkeys")
   else
     logger -t nadar -- 'Baseline initialized; existing listeners are not alerted'
@@ -372,17 +519,209 @@ check_once() {
   trap - RETURN
 }
 
+
+# Verify that the notification facility actually works. Never touch the baseline.
+test_notify() {
+  if ! command -v notify-send >/dev/null 2>&1; then
+    echo 'NADAR: notify-send is not installed (install libnotify)' >&2
+    return 1
+  fi
+  if notify-send -a NADAR -u normal -i network-wired \
+      'NADAR: test notification' 'Desktop notifications are working.'; then
+    echo 'Test notification sent.'
+  else
+    echo 'NADAR: the notification service did not accept the test alert.' >&2
+    return 1
+  fi
+}
+
+poke_remote() {
+  local answer
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo 'NADAR: timeout (coreutils) is required for --poke-remote.' >&2
+    return 1
+  fi
+  if ! answer=$(timeout 7 bash -c '
+      exec 3<>"/dev/tcp/$1/$2" || exit 1
+      printf "PING\n" >&3
+      IFS= read -r -t 4 reply <&3 || exit 1
+      printf "%s" "$reply"
+    ' _ "$REMOTE_POKE_HOST" "$REMOTE_POKE_PORT" 2>/dev/null); then
+    printf 'Remote health check failed: %s:%s (no valid response).\n' \
+      "$REMOTE_POKE_HOST" "$REMOTE_POKE_PORT" >&2
+    return 1
+  fi
+  if [[ $answer == OK ]]; then
+    printf 'Remote health: OK (%s:%s)\n' "$REMOTE_POKE_HOST" "$REMOTE_POKE_PORT"
+  else
+    printf 'Remote health check failed: unexpected response from %s:%s.\n' \
+      "$REMOTE_POKE_HOST" "$REMOTE_POKE_PORT" >&2
+    return 1
+  fi
+}
+
+# Produce two sorted CSV port lists. Exclude loopback-only sockets when
+# automatically enumerating internet-facing candidates on IPv4.
+scan_ports() {
+  local raw=${1:-} proto address port state process pid
+  local item first last number
+  local -A tcp_seen=() udp_seen=()
+  local -a items=()
+  if [[ -n $raw ]]; then
+    IFS=',' read -r -a items <<< "$raw"
+    for item in "${items[@]}"; do
+      trim "$item"; item=${REPLY^^}
+      if [[ ! $item =~ ^(TCP|UDP):([0-9]+)(-([0-9]+))?$ ]]; then
+        printf 'NADAR: invalid port specification: %s\n' "$item" >&2; return 2
+      fi
+      proto=${BASH_REMATCH[1]}
+      first=${BASH_REMATCH[2]}
+      last=${BASH_REMATCH[4]:-$first}
+      if (( 10#$first < 1 || 10#$first > 65535 || 10#$last > 65535 || 10#$first > 10#$last )); then
+        printf 'NADAR: invalid port range: %s\n' "$item" >&2; return 2
+      fi
+      # Bound expanded ranges to keep a mistaken flag from triggering
+      # an enormous remote scan. Small explicit ranges are supported.
+      if (( 10#$last - 10#$first > 127 )); then
+        printf 'NADAR: range exceeds 128 ports: %s\n' "$item" >&2; return 2
+      fi
+      for ((number=10#$first; number<=10#$last; number++)); do
+        if [[ $proto == TCP ]]; then tcp_seen[$number]=1; else udp_seen[$number]=1; fi
+      done
+    done
+  else
+    local collected
+    if ! collected=$(collect); then
+      echo 'NADAR: unable to obtain local listeners using ss.' >&2; return 1
+    fi
+    while IFS=$'\t' read -r proto state address port process pid; do
+      [[ -n $proto ]] || continue
+      case $address in
+        127.*|\[::1\]|\[::ffff:127.*\]|::1|localhost) continue ;;
+      esac
+      [[ $port =~ ^[0-9]+$ ]] || continue
+      if [[ $proto == tcp ]]; then tcp_seen["$port"]=1; else udp_seen["$port"]=1; fi
+    done <<< "$collected"
+  fi
+  local tcp_csv='' udp_csv=''
+  if ((${#tcp_seen[@]})); then tcp_csv=$(printf '%s\n' "${!tcp_seen[@]}" | sort -n | paste -sd, -); fi
+  if ((${#udp_seen[@]})); then udp_csv=$(printf '%s\n' "${!udp_seen[@]}" | sort -n | paste -sd, -); fi
+  printf '%s\t%s\n' "$tcp_csv" "$udp_csv"
+}
+
+# A restricted, root-owned Nmap wrapper on Ouroboros performs both protocols.
+# Validate every interpolated value before constructing the SSH command.
+# The sudoers entry authorizes ONLY the wrapper, not unrestricted Nmap.
+remote_nmap() {
+  local proto=$1 ports=$2 target=$3 cmd output result
+  [[ $proto == tcp || $proto == udp ]] || {
+    echo 'NADAR: invalid scan protocol.' >&2; return 2;
+  }
+  [[ $ports =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    echo 'NADAR: invalid scan port list.' >&2; return 2;
+  }
+  valid_ipv4 "$target" || {
+    echo 'NADAR: invalid remote scan target.' >&2; return 2;
+  }
+  cmd="sudo -n /usr/local/libexec/nadar-scan $proto $ports $target"
+  if output=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 \
+      "$REMOTE_SSH_HOST" "$cmd" 2>&1); then
+    printf '%s' "$output"
+  else
+    result=$?
+    printf '%s\n' "$output" >&2
+    return "$result"
+  fi
+}
+
+show_scan_results() {
+  local proto=$1 ports_csv=$2 scan_output=$3 line entries entry port status rest key
+  local -A states=()
+  local -a requested=() observed=()
+  while IFS= read -r line; do
+    [[ $line == Host:*'Ports: '* ]] || continue
+    entries=${line#*'Ports: '}
+    entries=${entries%%$'\t'Ignored*}
+    IFS=',' read -r -a observed <<< "$entries"
+    for entry in "${observed[@]}"; do
+      trim "$entry"; entry=$REPLY
+      [[ $entry =~ ^([0-9]+)/([^/]+)/([a-z]+)/ ]] || continue
+      [[ ${BASH_REMATCH[3]} == "$proto" ]] || continue
+      states["${BASH_REMATCH[1]}"]=${BASH_REMATCH[2]}
+    done
+  done <<< "$scan_output"
+  IFS=',' read -r -a requested <<< "$ports_csv"
+  for port in "${requested[@]}"; do
+    status=${states["$port"]:-not-reported}
+    case $status in
+      open) printf '%b%-4s%b %5s  %b%s%b\n' "$VIOLET" "${proto^^}" "$RESET" "$port" "$GREEN" "$status" "$RESET" ;;
+      closed) printf '%b%-4s%b %5s  %b%s%b\n' "$VIOLET" "${proto^^}" "$RESET" "$port" "$RED" "$status" "$RESET" ;;
+      *) printf '%b%-4s%b %5s  %b%s%b\n' "$VIOLET" "${proto^^}" "$RESET" "$port" "$AMBER" "$status" "$RESET" ;;
+    esac
+  done
+}
+
+remote_verify() {
+  local requested=${1:-} target ports tcp_csv udp_csv output retval=0
+  local discovered
+  if ! discovered=$(scan_ports "$requested"); then return 2; fi
+  # Tabs delimit the lists even when one is empty.
+  # Bash read with tab IFS collapses empty columns; parse directly instead.
+  tcp_csv=${discovered%%$'\t'*}
+  udp_csv=${discovered#*$'\t'}
+  if [[ -z $tcp_csv && -z $udp_csv ]]; then
+    echo 'NADAR: no eligible listening ports to scan.'
+    return 0
+  fi
+  target=$REMOTE_SCAN_TARGET
+  if [[ -z $target ]]; then
+    if ! target=$(curl -4fsS --connect-timeout 4 --max-time 8 https://ifconfig.co/ip); then
+      echo 'NADAR: unable to determine public IPv4; set REMOTE_SCAN_TARGET.' >&2
+      return 1
+    fi
+    target=${target//$'\r'/}
+    target=${target//$'\n'/}
+    valid_ipv4 "$target" || {
+      echo 'NADAR: public-IP endpoint returned an invalid IPv4 address.' >&2; return 1;
+    }
+  fi
+  printf 'NADAR remote verification — target %s, scanner %s\n' "$target" "$REMOTE_SSH_HOST"
+  echo 'Results describe reachability from the remote scanner, not the local firewall rules.'
+  if [[ -n $tcp_csv ]]; then
+    if output=$(remote_nmap tcp "$tcp_csv" "$target"); then
+      show_scan_results tcp "$tcp_csv" "$output"
+    else
+      echo 'NADAR: remote TCP scan failed (check SSH and the remote sudo helper).' >&2; retval=1
+    fi
+  fi
+  if [[ -n $udp_csv ]]; then
+    if output=$(remote_nmap udp "$udp_csv" "$target"); then
+      show_scan_results udp "$udp_csv" "$output"
+      echo 'UDP open|filtered does not confirm an open port.'
+    else
+      printf 'NADAR: UDP ports not verified (check remote scanner helper and sudoers).\n' >&2
+      retval=1
+    fi
+  fi
+  return "$retval"
+}
+
 case ${1:-} in
   ''|--list) show_list ;;
   --summary) show_summary ;;
   --summary-html) summary_html ;;
   --watch)
-    echo "NADAR watching local listeners every ${INTERVAL}s" >&2
+    echo "NADAR monitoring local listeners every ${INTERVAL}s" >&2
     while :; do check_once; sleep "$INTERVAL"; done
     ;;
   --once) check_once ;;
+  --test-notify) test_notify ;;
+  --poke-remote) poke_remote ;;
+  --scan|--remote-verify)
+    (($# <= 2)) || { echo 'NADAR: --scan accepts one optional port list.' >&2; exit 2; }
+    remote_verify "${2:-}" ;;
   --status) systemctl --user status nadar.service --no-pager ;;
-  --reset) rm -f -- "$STATE_FILE"; echo 'Lähtötilanne nollattu.' ;;
+  --reset) rm -f -- "$STATE_FILE"; echo 'Listener baseline reset.' ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

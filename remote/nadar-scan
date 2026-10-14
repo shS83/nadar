@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# NADAR restricted Nmap helper, intended to be root-owned on Ouroboros.
+# sudoers permits running THIS executable only, never /usr/bin/nmap directly.
+set -Eeuo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+fail() { printf 'NADAR SCANNER: %s\n' "$1" >&2; exit 2; }
+
+(($# == 3)) || fail 'Usage: nadar-scan tcp|udp PORT[,PORT...] IPv4'
+proto=$1
+port_csv=$2
+target=$3
+[[ $proto == tcp || $proto == udp ]] || fail 'Protocol must be tcp or udp'
+[[ $port_csv =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]] || fail 'Invalid port list'
+
+IFS=',' read -r -a ports <<< "$port_csv"
+((${#ports[@]} > 0 && ${#ports[@]} <= 128)) || fail 'Up to 128 ports per scan are allowed'
+for port in "${ports[@]}"; do
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || fail "Port out of range: $port"
+done
+
+[[ $target =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail 'Target must be an IPv4 literal'
+IFS='.' read -r -a octets <<< "$target"
+for octet in "${octets[@]}"; do
+  (( 10#$octet <= 255 )) || fail 'Invalid IPv4 address'
+done
+
+# Optional root-owned whitelist: one exact IPv4 per line. Especially useful
+# for non-roaming static targets. If the file exists, it is mandatory.
+if [[ -e /etc/nadar/allowed-targets ]]; then
+  [[ -f /etc/nadar/allowed-targets && -r /etc/nadar/allowed-targets ]] || fail 'Target allowlist cannot be read'
+  grep -Fxq -- "$target" /etc/nadar/allowed-targets || fail 'Target is not in /etc/nadar/allowed-targets'
+fi
+
+(( EUID == 0 )) || { printf 'NADAR SCANNER: Run through the configured sudoers rule.\n' >&2; exit 77; }
+[[ -x /usr/bin/nmap ]] || { printf 'NADAR SCANNER: Install nmap on Ouroboros.\n' >&2; exit 127; }
+
+case $proto in
+  tcp) scanmode=-sT ;;
+  udp) scanmode=-sU ;;
+esac
+exec /usr/bin/nmap -Pn -n "$scanmode" --max-retries 1 --host-timeout 90s -oG - -p "$port_csv" "$target"

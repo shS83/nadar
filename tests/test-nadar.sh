@@ -50,6 +50,14 @@ CONF
 ! grep -Eq 'spotify|firefox|3999|1900|50000' "$TMP/list"
 grep -q '8080.*sshd.*900' "$TMP/list"
 grep -q '445' "$TMP/list" # ei piiloteta tuntemattoman prosessin portteja
+# Puuttuvan prosessin UTF-8-viiva ei saa siirtää PID-saraketta.
+header=$(head -n 1 "$TMP/list")
+row=$(grep -E '^tcp[[:space:]]+LISTEN[[:space:]]+0\.0\.0\.0[[:space:]]+445' "$TMP/list")
+col_prefix=${header%%PID*}
+normalized=${row//—/-}
+[[ ${normalized:${#col_prefix}:1} == '-' ]] || {
+  echo 'FAIL: --list PID column is misaligned after a UTF-8 dash' >&2; exit 1;
+}
 "$NADAR" --summary > "$TMP/summary"
 grep -q '8080.*sshd' "$TMP/summary"
 ! grep -q 'spotify' "$TMP/summary"
@@ -57,6 +65,30 @@ grep -q '8080.*sshd' "$TMP/summary"
 "$NADAR" --once
 [[ $(grep -c '^LOG ' "$TMP/log") == 1 ]]
 ! grep -q '^NOTIFY ' "$TMP/log"
+
+# Hälytys näyttää uuden kuuntelijan prosessinimen, yhdistää samalle
+# osoitteelle/portille kuuluvat nimet ja jättää nimet pois jos ss ei niitä näytä.
+cat >> "$TMP/fixture" <<'DATA'
+tcp LISTEN 0 128 127.0.0.1:9090 0.0.0.0:* users:(("python3",pid=2030,fd=2))
+tcp LISTEN 0 128 127.0.0.1:9090 0.0.0.0:* users:(("python3",pid=2030,fd=3))
+tcp LISTEN 0 128 127.0.0.1:9090 0.0.0.0:* users:(("uvicorn",pid=2031,fd=4))
+tcp LISTEN 0 128 127.0.0.1:9091 0.0.0.0:*
+tcp LISTEN 0 128 127.0.0.1:9393 0.0.0.0:* users:(("spotify",pid=1567,fd=11))
+DATA
+"$NADAR" --once
+[[ $(grep -c '^NOTIFY ' "$TMP/log") == 2 ]] || {
+  echo 'FAIL: newly listening ports did not trigger exactly two alerts' >&2; exit 1;
+}
+[[ $(grep -c 'Process: python3, uvicorn' "$TMP/log") == 1 ]] || {
+  echo 'FAIL: incorrect process name aggregation or notification text' >&2; exit 1;
+}
+grep -q 'NEW LISTENER tcp 127.0.0.1:9090 process=python3, uvicorn' "$TMP/log"
+grep '^NOTIFY ' "$TMP/log" | grep -q '9091.*external reachability not checked'
+! grep -q '9393' "$TMP/log"
+"$NADAR" --once
+[[ $(grep -c '^NOTIFY ' "$TMP/log") == 2 ]] || {
+  echo 'FAIL: duplicate listener alert' >&2; exit 1;
+}
 
 cat > "$CONF" <<'CONF'
 LISTENPROTO="TCP"
@@ -66,6 +98,18 @@ EXCLUDE_PIDS=""
 CONF
 "$NADAR" --summary > "$TMP/summary"
 grep -q '50000.*other, firefox.*3999, 1447' "$TMP/summary"
+# --summary: sekä PID että SOCKETS pysyvät otsikkonsa alla.
+header=$(sed -n '2p' "$TMP/summary")
+row=$(grep -E '^tcp[[:space:]]+LISTEN[[:space:]]+0\.0\.0\.0[[:space:]]+445' "$TMP/summary")
+normalized=${row//—/-}
+col_prefix=${header%%PID*}
+[[ ${normalized:${#col_prefix}:1} == '-' ]] || {
+  echo 'FAIL: --summary PID column is misaligned' >&2; exit 1;
+}
+col_prefix=${header%%SOCKETS*}
+[[ ${normalized:${#col_prefix}:1} == '1' ]] || {
+  echo 'FAIL: --summary SOCKETS column is misaligned' >&2; exit 1;
+}
 ! grep -q '54661' "$TMP/summary"
 NADAR_HTML_PATH="$TMP/summary.html" "$NADAR" --summary-html > /dev/null
 grep -q 'other, firefox' "$TMP/summary.html"
@@ -90,6 +134,6 @@ CONF
 if "$NADAR" --list > /dev/null 2> "$TMP/error"; then
   echo 'FAIL: invalid EXCLUDE_PIDS accepted' >&2; exit 1
 fi
-grep -q 'virheellinen PID' "$TMP/error"
+grep -q 'invalid PID' "$TMP/error"
 
-echo 'OK: NADAR process/PID exclusions, shared sockets, summaries, HTML, baseline and validation'
+echo 'OK: NADAR exclusions, shared sockets, new-listener notifications, summaries, HTML, baseline and validation'

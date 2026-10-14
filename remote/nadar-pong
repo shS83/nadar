@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# A deliberately minimal, socket-activated health responder.
+# Receives one line, replies with OK for PING or ERR for anything else.
+set -euo pipefail
+if IFS= read -r -t 5 request; then
+  case ${request%$'\r'} in
+    PING) printf 'OK\n' ;;
+    *) printf 'ERR\n' ;;
+  esac
+fi

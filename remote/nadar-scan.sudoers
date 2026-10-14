@@ -1,0 +1,5 @@
+# NADAR v0.6.0: restricted remote scanning for SSH account santeri.
+# The helper MUST be root-owned and not writable by non-root users.
+# The path alone (no sudoers argument restriction) allows any validated
+# arguments handled by the helper; it does NOT permit direct Nmap access.
+santeri ALL=(root) NOPASSWD: /usr/local/libexec/nadar-scan

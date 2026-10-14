@@ -1,0 +1,15 @@
+[Unit]
+Description=NADAR remote health check responder for %I
+
+[Service]
+Type=exec
+ExecStart=/usr/local/libexec/nadar-pong
+StandardInput=socket
+StandardOutput=inherit
+StandardError=journal
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=32M

@@ -2,6 +2,13 @@
 set -Eeuo pipefail
 
 APP=nadar
+VERSION=0.6.0
+
+# Report the version without reading config or invoking monitoring tools.
+case ${1:-} in
+  -v|--version) printf '%s v%s\n' "${APP^^}" "$VERSION"; exit 0 ;;
+esac
+
 # Configuration is parsed as data, not sourced as shell code.
 CONFIG_FILE=${NADAR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/nadar/nadar.conf}
 LISTENPROTO='TCP,UDP'
@@ -182,8 +189,8 @@ else
 fi
 
 usage() {
+  printf 'NADAR - Network Anomaly Detection and Reporting v%s\n' "$VERSION"
   cat <<'HELP'
-NADAR - Network Anomaly Detection and Reporting v0.6.0
 
 Usage:
   nadar [--list]                    Show colorized local TCP/UDP sockets
@@ -197,6 +204,7 @@ Usage:
   nadar --remote-verify [PORTS]     Alias of --scan (backward compatible)
   nadar --status                    Show the systemd user service status
   nadar --reset                     Reset the local listener baseline
+  nadar --version, -v               Show version and exit
   nadar --help                      Show this help
 
 Remote scan examples:

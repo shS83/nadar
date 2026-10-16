@@ -69,6 +69,7 @@ nadar --scan TCP:420,UDP:11000       Scan specific TCP/UDP ports
 nadar --remote-verify                Backward-compatible alias of --scan
 nadar --status                       Show systemd user service status
 nadar --reset                        Reset the baseline (no alerts on first run)
+nadar --version, -v                  Show version and exit
 nadar --help                         Full English help
 ```
 
